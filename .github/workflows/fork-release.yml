@@ -1,0 +1,408 @@
+name: Fork Release macOS and Windows
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Branch, tag, or commit to build
+        required: true
+        default: feat/codex-github-copilot
+        type: string
+      base_version:
+        description: Numeric base version, for example 3.17.0
+        required: true
+        default: 3.17.0
+        type: string
+      sequence:
+        description: Release sequence from 1 to 65535
+        required: true
+        default: '1'
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-release-channel
+  cancel-in-progress: false
+
+jobs:
+  metadata:
+    if: github.repository == 'liuziyuan/cc-switch' && github.ref == 'refs/heads/main'
+    name: Validate release metadata
+    runs-on: ubuntu-22.04
+    outputs:
+      build_version: ${{ steps.metadata.outputs.build_version }}
+      release_tag: ${{ steps.metadata.outputs.release_tag }}
+      source_sha: ${{ steps.metadata.outputs.source_sha }}
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.source_ref }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate inputs and repository configuration
+        id: metadata
+        shell: bash
+        env:
+          BASE_VERSION: ${{ inputs.base_version }}
+          SEQUENCE: ${{ inputs.sequence }}
+          UPDATER_PUBLIC_KEY: ${{ vars.FORK_UPDATER_PUBKEY }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$BASE_VERSION" =~ ^(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,4})$ ]]; then
+            echo "base_version must be canonical major.minor.patch numeric SemVer" >&2
+            exit 1
+          fi
+          IFS=. read -r major minor patch <<< "$BASE_VERSION"
+          if (( major > 255 || minor > 255 || patch > 65535 )); then
+            echo "base_version exceeds WiX limits: major/minor <= 255, patch <= 65535" >&2
+            exit 1
+          fi
+          if [[ ! "$SEQUENCE" =~ ^[1-9][0-9]{0,4}$ ]] || (( SEQUENCE > 65535 )); then
+            echo "sequence must be an integer from 1 to 65535" >&2
+            exit 1
+          fi
+          if [ -z "$UPDATER_PUBLIC_KEY" ]; then
+            echo "FORK_UPDATER_PUBKEY repository variable is missing" >&2
+            exit 1
+          fi
+
+          build_version="${BASE_VERSION}-${SEQUENCE}"
+          release_tag="v${BASE_VERSION}-copilot-codex"
+          if [ "$SEQUENCE" != "1" ]; then
+            release_tag="${release_tag}.${SEQUENCE}"
+          fi
+
+          if git ls-remote --exit-code --tags origin "refs/tags/${release_tag}" >/dev/null 2>&1; then
+            echo "Tag ${release_tag} already exists; increment sequence instead" >&2
+            exit 1
+          fi
+
+          latest_url="https://github.com/liuziyuan/cc-switch/releases/latest/download/latest.json"
+          current_json="$RUNNER_TEMP/current-latest.json"
+          http_status=$(curl --silent --show-error --location --output "$current_json" --write-out '%{http_code}' "$latest_url")
+          if [ "$http_status" = "200" ]; then
+            CURRENT_JSON_PATH="$current_json" CANDIDATE_VERSION="$build_version" node <<'NODE'
+          const fs = require('node:fs');
+          const parse = (value) => {
+            const match = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)-([1-9]\d*)$/.exec(value);
+            if (!match) throw new Error(`Unsupported fork updater version: ${value}`);
+            return match.slice(1).map(BigInt);
+          };
+          const compare = (left, right) => {
+            for (let index = 0; index < left.length; index += 1) {
+              if (left[index] !== right[index]) return left[index] > right[index] ? 1 : -1;
+            }
+            return 0;
+          };
+
+          const current = JSON.parse(fs.readFileSync(process.env.CURRENT_JSON_PATH, 'utf8')).version;
+          const candidate = process.env.CANDIDATE_VERSION;
+          if (compare(parse(candidate), parse(current)) <= 0) {
+            throw new Error(`Candidate ${candidate} must be newer than current ${current}`);
+          }
+          NODE
+          elif [ "$http_status" != "404" ]; then
+            echo "Unable to read current updater metadata: HTTP $http_status" >&2
+            exit 1
+          fi
+
+          {
+            echo "build_version=$build_version"
+            echo "release_tag=$release_tag"
+            echo "source_sha=$(git rev-parse HEAD)"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.name }}
+    needs: metadata
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS universal
+            os: macos-14
+            platform: macos
+          - name: Windows x64
+            os: windows-2022
+            platform: windows
+    steps:
+      - name: Checkout release source
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.metadata.outputs.source_sha }}
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '20'
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 10.12.3
+          run_install: false
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Add macOS Rust targets
+        if: matrix.platform == 'macos'
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Create fork Tauri configuration
+        shell: bash
+        env:
+          BUILD_VERSION: ${{ needs.metadata.outputs.build_version }}
+          UPDATER_PUBLIC_KEY: ${{ vars.FORK_UPDATER_PUBKEY }}
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const fs = require('node:fs');
+          const path = require('node:path');
+
+          const config = {
+            version: process.env.BUILD_VERSION,
+            bundle: { createUpdaterArtifacts: false },
+            plugins: {
+              updater: {
+                pubkey: process.env.UPDATER_PUBLIC_KEY,
+                endpoints: [
+                  'https://github.com/liuziyuan/cc-switch/releases/latest/download/latest.json',
+                ],
+              },
+            },
+          };
+          const destination = path.join(process.env.RUNNER_TEMP, 'fork-tauri.conf.json');
+          fs.writeFileSync(destination, `${JSON.stringify(config, null, 2)}\n`);
+          fs.appendFileSync(process.env.GITHUB_ENV, `FORK_TAURI_CONFIG=${destination}\n`);
+          NODE
+
+      - name: Build macOS app
+        if: matrix.platform == 'macos'
+        shell: bash
+        run: pnpm tauri build --target universal-apple-darwin --config "$FORK_TAURI_CONFIG"
+
+      - name: Build Windows app
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: pnpm tauri build --bundles msi --config "$env:FORK_TAURI_CONFIG"
+
+      - name: Prepare macOS unsigned assets
+        if: matrix.platform == 'macos'
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.metadata.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+
+          bundle_root="src-tauri/target/universal-apple-darwin/release/bundle"
+          app_path=$(find "$bundle_root/macos" -maxdepth 1 -name '*.app' -type d -print -quit)
+          dmg_path=$(find "$bundle_root/dmg" -maxdepth 1 -name '*.dmg' -type f -print -quit)
+
+          test -n "$app_path"
+          test -n "$dmg_path"
+
+          tar -czf "release-assets/CC-Switch-${RELEASE_TAG}-macOS.tar.gz" -C "$bundle_root/macos" "$(basename "$app_path")"
+          cp "$dmg_path" "release-assets/CC-Switch-${RELEASE_TAG}-macOS.dmg"
+          ditto -c -k --sequesterRsrc --keepParent "$app_path" \
+            "release-assets/CC-Switch-${RELEASE_TAG}-macOS.zip"
+
+      - name: Prepare Windows unsigned assets
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ needs.metadata.outputs.release_tag }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path release-assets | Out-Null
+
+          $msi = Get-ChildItem -Path 'src-tauri/target/release/bundle/msi' -Recurse -Include *.msi | Select-Object -First 1
+          if ($null -eq $msi) { throw 'No Windows MSI installer found' }
+          Copy-Item $msi.FullName "release-assets/CC-Switch-$env:RELEASE_TAG-Windows.msi"
+
+          $exePath = 'src-tauri/target/release/cc-switch.exe'
+          if (-not (Test-Path $exePath)) { throw 'No Windows executable found' }
+          $portableDir = 'release-assets/CC-Switch-Portable'
+          New-Item -ItemType Directory -Force -Path $portableDir | Out-Null
+          Copy-Item $exePath $portableDir
+          @('# CC Switch portable build marker', 'portable=true') | Set-Content -Path (Join-Path $portableDir 'portable.ini') -Encoding UTF8
+          Compress-Archive -Path "$portableDir/*" -DestinationPath "release-assets/CC-Switch-$env:RELEASE_TAG-Windows-Portable.zip" -Force
+          Remove-Item -Recurse -Force $portableDir
+
+      - name: Upload unsigned release assets
+        uses: actions/upload-artifact@v7
+        with:
+          name: fork-release-${{ matrix.platform }}
+          path: release-assets/*
+          if-no-files-found: error
+
+  sign-and-stage:
+    name: Sign and stage draft release
+    needs: [metadata, build]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    environment: fork-release
+    steps:
+      - name: Checkout trusted release tooling
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '20'
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 10.12.3
+          run_install: false
+
+      - name: Install trusted signing CLI
+        run: pnpm install --frozen-lockfile --ignore-scripts
+
+      - name: Download unsigned assets
+        uses: actions/download-artifact@v8
+        with:
+          pattern: fork-release-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Sign updater assets and generate latest.json
+        shell: bash
+        env:
+          BUILD_VERSION: ${{ needs.metadata.outputs.build_version }}
+          RELEASE_TAG: ${{ needs.metadata.outputs.release_tag }}
+          TAURI_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          test -n "$TAURI_PRIVATE_KEY"
+          test -n "$TAURI_PRIVATE_KEY_PASSWORD"
+
+          mac_artifact=$(find release-assets -maxdepth 1 -name '*-macOS.tar.gz' -type f -print -quit)
+          windows_artifact=$(find release-assets -maxdepth 1 -name '*-Windows.msi' -type f -print -quit)
+          test -n "$mac_artifact"
+          test -n "$windows_artifact"
+
+          pnpm exec tauri signer sign -k "$TAURI_PRIVATE_KEY" -p "$TAURI_PRIVATE_KEY_PASSWORD" "$mac_artifact" >/dev/null
+          pnpm exec tauri signer sign -k "$TAURI_PRIVATE_KEY" -p "$TAURI_PRIVATE_KEY_PASSWORD" "$windows_artifact" >/dev/null
+
+          node <<'NODE'
+          const fs = require('node:fs');
+          const path = require('node:path');
+
+          const assets = fs.readdirSync('release-assets');
+          const one = (suffix) => {
+            const matches = assets.filter((name) => name.endsWith(suffix));
+            if (matches.length !== 1) {
+              throw new Error(`Expected one ${suffix} asset, found ${matches.length}`);
+            }
+            return matches[0];
+          };
+          const signedPlatform = (artifact) => {
+            const signaturePath = path.join('release-assets', `${artifact}.sig`);
+            if (!fs.existsSync(signaturePath)) {
+              throw new Error(`Missing signature for ${artifact}`);
+            }
+            return {
+              signature: fs.readFileSync(signaturePath, 'utf8').trim(),
+              url: `https://github.com/liuziyuan/cc-switch/releases/download/${process.env.RELEASE_TAG}/${artifact}`,
+            };
+          };
+
+          const mac = signedPlatform(one('-macOS.tar.gz'));
+          const windows = signedPlatform(one('-Windows.msi'));
+          const latest = {
+            version: process.env.BUILD_VERSION,
+            notes: `CC Switch ${process.env.RELEASE_TAG}`,
+            pub_date: new Date().toISOString(),
+            platforms: {
+              'darwin-aarch64': mac,
+              'darwin-x86_64': mac,
+              'windows-x86_64': windows,
+            },
+          };
+          fs.writeFileSync('release-assets/latest.json', `${JSON.stringify(latest, null, 2)}\n`);
+          NODE
+
+      - name: Create atomic draft release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUILD_VERSION: ${{ needs.metadata.outputs.build_version }}
+          RELEASE_TAG: ${{ needs.metadata.outputs.release_tag }}
+          SOURCE_SHA: ${{ needs.metadata.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          release_api="repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}"
+          cleanup_draft() {
+            local release_id
+            release_id=$(gh api "$release_api" --jq 'select(.draft == true) | .id' 2>/dev/null || true)
+            if [ -n "$release_id" ]; then
+              gh api --method DELETE "repos/${GITHUB_REPOSITORY}/releases/${release_id}"
+            fi
+          }
+
+          if existing_release=$(gh api "$release_api" 2>/dev/null); then
+            if [ "$(jq -r '.draft' <<< "$existing_release")" != "true" ]; then
+              echo "Release ${RELEASE_TAG} already exists and is not a draft" >&2
+              exit 1
+            fi
+            cleanup_draft
+          fi
+
+          notes_file="$RUNNER_TEMP/release-notes.md"
+          cat > "$notes_file" <<EOF
+          ## CC Switch ${RELEASE_TAG}
+
+          Fork build containing the Codex GitHub Copilot integration.
+
+          Embedded updater version: \`${BUILD_VERSION}\`
+          Source commit: \`${SOURCE_SHA}\`
+
+          - macOS universal: DMG or ZIP
+          - Windows x64: MSI or portable ZIP
+
+          macOS artifacts are not Apple-notarized. Windows artifacts are not Authenticode-signed.
+          EOF
+
+          trap cleanup_draft ERR
+          gh release create "$RELEASE_TAG" release-assets/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$SOURCE_SHA" \
+            --title "CC Switch $RELEASE_TAG" \
+            --notes-file "$notes_file" \
+            --draft \
+            --latest=false
+          trap - ERR
+
+  publish:
+    name: Publish release and updater metadata
+    needs: [metadata, sign-and-stage]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    environment: fork-release
+    steps:
+      - name: Publish draft as latest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.metadata.outputs.release_tag }}
+        run: gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false --prerelease=false --latest
