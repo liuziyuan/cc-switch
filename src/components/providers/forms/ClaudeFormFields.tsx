@@ -36,6 +36,7 @@ import EndpointSpeedTest from "./EndpointSpeedTest";
 import { ApiKeySection, EndpointField, ModelInputWithFetch } from "./shared";
 import { CopilotAuthSection } from "./CopilotAuthSection";
 import { CodexOAuthSection } from "./CodexOAuthSection";
+import { XaiOAuthSection } from "./XaiOAuthSection";
 import {
   copilotGetModels,
   copilotGetModelsForAccount,
@@ -43,6 +44,7 @@ import {
 import type { CopilotModel } from "@/lib/api/copilot";
 import {
   fetchCodexOauthModels,
+  fetchXaiOauthModels,
   fetchModelsForConfig,
   showFetchModelsError,
   type FetchedModel,
@@ -98,6 +100,12 @@ interface ClaudeFormFieldsProps {
   codexFastMode?: boolean;
   onCodexFastModeChange?: (enabled: boolean) => void;
 
+  // xAI OAuth
+  isXaiOauthPreset?: boolean;
+  isXaiOauthAuthenticated?: boolean;
+  selectedXaiAccountId?: string | null;
+  onXaiAccountSelect?: (accountId: string | null) => void;
+
   // Template Values
   templateValueEntries: Array<[string, TemplateValueConfig]>;
   templateValues: Record<string, TemplateValueConfig>;
@@ -151,6 +159,10 @@ interface ClaudeFormFieldsProps {
   onLocalProxyHeadersOverrideChange: (value: string) => void;
   localProxyBodyOverride: string;
   onLocalProxyBodyOverrideChange: (value: string) => void;
+
+  // auto mode 安全分类器专用模型（需启用代理才生效）
+  classifierModel: string;
+  onClassifierModelChange: (value: string) => void;
 }
 
 export function ClaudeFormFields({
@@ -174,6 +186,10 @@ export function ClaudeFormFields({
   onCodexAccountSelect,
   codexFastMode,
   onCodexFastModeChange,
+  isXaiOauthPreset,
+  isXaiOauthAuthenticated,
+  selectedXaiAccountId,
+  onXaiAccountSelect,
   templateValueEntries,
   templateValues,
   templatePresetName,
@@ -212,6 +228,8 @@ export function ClaudeFormFields({
   onLocalProxyHeadersOverrideChange,
   localProxyBodyOverride,
   onLocalProxyBodyOverrideChange,
+  classifierModel,
+  onClassifierModelChange,
 }: ClaudeFormFieldsProps) {
   const { t } = useTranslation();
   const hasRequestOverrides = Boolean(
@@ -224,19 +242,24 @@ export function ClaudeFormFields({
     defaultOpusModel ||
     defaultFableModel ||
     subagentModel ||
-    apiFormat !== "anthropic" ||
+    (!isXaiOauthPreset && apiFormat !== "anthropic") ||
     apiKeyField !== "ANTHROPIC_AUTH_TOKEN" ||
     customUserAgent ||
+    classifierModel ||
     hasRequestOverrides
   );
-  const [advancedExpanded, setAdvancedExpanded] = useState(hasAnyAdvancedValue);
+  const [advancedExpanded, setAdvancedExpanded] = useState(
+    isXaiOauthPreset ? false : hasAnyAdvancedValue,
+  );
 
   // 预设填充高级值后自动展开（仅从折叠→展开，不会自动折叠）
   useEffect(() => {
-    if (hasAnyAdvancedValue) {
+    if (isXaiOauthPreset) {
+      setAdvancedExpanded(false);
+    } else if (hasAnyAdvancedValue) {
       setAdvancedExpanded(true);
     }
-  }, [hasAnyAdvancedValue]);
+  }, [hasAnyAdvancedValue, isXaiOauthPreset]);
 
   // Copilot 可用模型列表
   const [copilotModels, setCopilotModels] = useState<CopilotModel[]>([]);
@@ -247,6 +270,10 @@ export function ClaudeFormFields({
   const [codexOauthModels, setCodexOauthModels] = useState<FetchedModel[]>([]);
   const [codexOauthModelsLoading, setCodexOauthModelsLoading] = useState(false);
   const codexOauthModelsRequestRef = useRef(0);
+
+  const [xaiOauthModels, setXaiOauthModels] = useState<FetchedModel[]>([]);
+  const [xaiOauthModelsLoading, setXaiOauthModelsLoading] = useState(false);
+  const xaiOauthModelsRequestRef = useRef(0);
   const fallbackUsesOneM = hasClaudeOneMMarker(claudeModel);
 
   // 通用模型获取（非 Copilot 供应商）
@@ -373,6 +400,37 @@ export function ClaudeFormFields({
     t,
   ]);
 
+  const handleFetchXaiOauthModels = useCallback(() => {
+    if (!isXaiOauthAuthenticated) {
+      toast.error(
+        t("xaiOauth.loginRequired", {
+          defaultValue: "请先登录 xAI 账号",
+        }),
+      );
+      return;
+    }
+
+    const requestId = xaiOauthModelsRequestRef.current + 1;
+    xaiOauthModelsRequestRef.current = requestId;
+    setXaiOauthModelsLoading(true);
+    fetchXaiOauthModels(selectedXaiAccountId)
+      .then((models) => {
+        if (xaiOauthModelsRequestRef.current !== requestId) return;
+        setXaiOauthModels(models);
+        showModelFetchResult(models.length);
+      })
+      .catch((err) => {
+        if (xaiOauthModelsRequestRef.current !== requestId) return;
+        console.warn("[XaiOAuth] Failed to fetch models:", err);
+        showFetchModelsError(err, t);
+      })
+      .finally(() => {
+        if (xaiOauthModelsRequestRef.current === requestId) {
+          setXaiOauthModelsLoading(false);
+        }
+      });
+  }, [isXaiOauthAuthenticated, selectedXaiAccountId, showModelFetchResult, t]);
+
   useEffect(() => {
     copilotModelsRequestRef.current += 1;
     setCopilotModels([]);
@@ -385,16 +443,26 @@ export function ClaudeFormFields({
     setCodexOauthModelsLoading(false);
   }, [isCodexOauthPreset, isCodexOauthAuthenticated, selectedCodexAccountId]);
 
+  useEffect(() => {
+    xaiOauthModelsRequestRef.current += 1;
+    setXaiOauthModels([]);
+    setXaiOauthModelsLoading(false);
+  }, [isXaiOauthPreset, isXaiOauthAuthenticated, selectedXaiAccountId]);
+
   const modelFetchLoading = isCopilotPreset
     ? modelsLoading
     : isCodexOauthPreset
       ? codexOauthModelsLoading
-      : isFetchingModels;
+      : isXaiOauthPreset
+        ? xaiOauthModelsLoading
+        : isFetchingModels;
   const handleModelFetchClick = isCopilotPreset
     ? handleFetchCopilotModels
     : isCodexOauthPreset
       ? handleFetchCodexOauthModels
-      : handleFetchModels;
+      : isXaiOauthPreset
+        ? handleFetchXaiOauthModels
+        : handleFetchModels;
 
   // 模型输入框：支持手动输入 + 下拉选择
   const renderModelInput = (
@@ -416,6 +484,19 @@ export function ClaudeFormFields({
           placeholder={placeholder}
           fetchedModels={codexOauthModels}
           isLoading={codexOauthModelsLoading}
+        />
+      );
+    }
+
+    if (isXaiOauthPreset) {
+      return (
+        <ModelInputWithFetch
+          id={id}
+          value={value}
+          onChange={updateValue}
+          placeholder={placeholder}
+          fetchedModels={xaiOauthModels}
+          isLoading={xaiOauthModelsLoading}
         />
       );
     }
@@ -619,6 +700,13 @@ export function ClaudeFormFields({
         />
       )}
 
+      {isXaiOauthPreset && (
+        <XaiOAuthSection
+          selectedAccountId={selectedXaiAccountId}
+          onAccountSelect={onXaiAccountSelect}
+        />
+      )}
+
       {/* API Key 输入框（非 OAuth 预设时显示） */}
       {shouldShowApiKey && !usesOAuth && (
         <ApiKeySection
@@ -693,7 +781,7 @@ export function ClaudeFormFields({
           onManageClick={
             showEndpointTools ? () => onEndpointModalToggle(true) : undefined
           }
-          showFullUrlToggle={showEndpointTools}
+          showFullUrlToggle={showEndpointTools && !isXaiOauthPreset}
           isFullUrl={isFullUrl}
           onFullUrlChange={onFullUrlChange}
         />
@@ -739,7 +827,7 @@ export function ClaudeFormFields({
           )}
           <CollapsibleContent className="space-y-4 pt-2">
             {/* API 格式选择（仅非云服务商显示） */}
-            {category !== "cloud_provider" && (
+            {category !== "cloud_provider" && !isXaiOauthPreset && (
               <div className="space-y-2">
                 <FormLabel htmlFor="apiFormat">
                   {t("providerForm.apiFormat", { defaultValue: "API 格式" })}
@@ -1019,6 +1107,30 @@ export function ClaudeFormFields({
                 {t("providerForm.fallbackModelHint", {
                   defaultValue:
                     "用于未明确落到 Sonnet、Opus、Fable、Haiku 角色的请求。使用第三方/中转端点时建议填写：否则这些请求（含 Haiku 后台子任务）会以原始 Claude 模型名透传给上游，可能因上游无此模型而报错。官方端点可留空。",
+                })}
+              </p>
+            </div>
+
+            <div className="space-y-2 border-t pt-4">
+              <FormLabel htmlFor="claudeClassifierModel">
+                {t("providerForm.classifierModelLabel", {
+                  defaultValue: "安全分类器模型",
+                })}
+              </FormLabel>
+              <Input
+                id="claudeClassifierModel"
+                value={classifierModel}
+                onChange={(event) =>
+                  onClassifierModelChange(event.target.value)
+                }
+                placeholder={t("providerForm.classifierModelPlaceholder", {
+                  defaultValue: "留空则跟随主模型",
+                })}
+              />
+              <p className="text-xs text-muted-foreground">
+                {t("providerForm.classifierModelHint", {
+                  defaultValue:
+                    "Claude Code 自动模式在放行每次工具调用前会先发一次安全评分请求，默认复用主模型；该请求非流式、带完整会话上下文，且只有 60 秒预算。主模型响应偏慢或延迟波动时，分类器会间歇性报「暂时不可用」并连带拦下工具调用。填入一个更快更稳的模型可避免此问题。仅在启用本地代理时生效。",
                 })}
               </p>
             </div>
