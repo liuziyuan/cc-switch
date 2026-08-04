@@ -2286,6 +2286,8 @@ function ProviderFormFull({
               onLocalProxyHeadersOverrideChange={setLocalProxyHeadersOverride}
               localProxyBodyOverride={localProxyBodyOverride}
               onLocalProxyBodyOverrideChange={setLocalProxyBodyOverride}
+              classifierModel={localClassifierModel}
+              onClassifierModelChange={setLocalClassifierModel}
             />
           )}
 
@@ -2341,8 +2343,6 @@ function ProviderFormFull({
               onLocalProxyHeadersOverrideChange={setLocalProxyHeadersOverride}
               localProxyBodyOverride={localProxyBodyOverride}
               onLocalProxyBodyOverrideChange={setLocalProxyBodyOverride}
-              classifierModel={localClassifierModel}
-              onClassifierModelChange={setLocalClassifierModel}
             />
           )}
 
